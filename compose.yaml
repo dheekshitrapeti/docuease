@@ -1,0 +1,11 @@
+services:
+  docuease:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: docuease:local
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+    restart: unless-stopped
