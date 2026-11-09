@@ -165,9 +165,23 @@ def align_value(value: Optional[str]) -> int:
 
 def resolve_font(font: Optional[str], bold: bool = False, italic: bool = False) -> str:
     name = (font or "").lower()
+    if "zapf" in name or "dingbat" in name:
+        return "zadb"
+    if "symbol" in name:
+        return "symb"
     if "courier" in name or "mono" in name or "consol" in name:
         family = "co"
-    elif "times" in name or "serif" in name or "georgia" in name or "garamond" in name:
+    elif (
+        "times" in name
+        or "serif" in name
+        or "georgia" in name
+        or "garamond" in name
+        or "palatino" in name
+        or "bookman" in name
+        or "schoolbook" in name
+        or "cambria" in name
+        or "constantia" in name
+    ):
         family = "ti"
     else:
         family = "he"
@@ -227,19 +241,59 @@ _STYLE_WORDS = {
 }
 _SYSTEM_FONT_CACHE: dict[tuple[str, bool, bool], Optional[str]] = {}
 
-# Metric-compatible open substitutes commonly shipped on Linux/Docker. This
-# keeps Word/Office PDFs looking right when the proprietary font is not
+# Metric-compatible or visually close open substitutes shipped on Linux/Docker.
+# This keeps Word/Office/web PDFs looking right when the proprietary font is not
 # installed on the server.
 _FAMILY_ALIASES = {
-    "arial": {"liberationsans", "nimbussans", "helvetica"},
-    "helvetica": {"liberationsans", "nimbussans", "arial"},
-    "times": {"liberationserif", "nimbusroman", "timesnewroman"},
-    "timesnewroman": {"liberationserif", "nimbusroman", "times"},
-    "courier": {"liberationmono", "nimbusmono", "couriernew"},
-    "couriernew": {"liberationmono", "nimbusmono", "courier"},
-    "calibri": {"carlito"},
-    "aptos": {"carlito", "liberationsans"},
-    "cambria": {"caladea"},
+    "arial": {"Liberation Sans", "Nimbus Sans", "Helvetica"},
+    "helvetica": {"Liberation Sans", "Nimbus Sans", "Arial"},
+    "helveticaneue": {"Liberation Sans", "Nimbus Sans"},
+    "sfns": {"Liberation Sans", "Nimbus Sans"},
+    "sfpro": {"Liberation Sans", "Nimbus Sans"},
+    "sfprodisplay": {"Liberation Sans", "Nimbus Sans"},
+    "sfprotext": {"Liberation Sans", "Nimbus Sans"},
+    "arialnarrow": {"Liberation Sans Narrow", "Nimbus Sans Narrow"},
+    "times": {"Liberation Serif", "Nimbus Roman", "Times New Roman"},
+    "timesnewroman": {"Liberation Serif", "Nimbus Roman", "Times"},
+    "courier": {"Liberation Mono", "Nimbus Mono", "Courier New"},
+    "couriernew": {"Liberation Mono", "Nimbus Mono", "Courier"},
+    "calibri": {"Carlito"},
+    "aptos": {"Inter", "Liberation Sans", "Carlito"},
+    "cambria": {"Caladea"},
+    "candara": {"Carlito"},
+    "corbel": {"Carlito"},
+    "constantia": {"Caladea"},
+    "georgia": {"DejaVu Serif"},
+    "garamond": {"EB Garamond", "DejaVu Serif"},
+    "palatino": {"P052", "DejaVu Serif"},
+    "bookantiqua": {"P052", "DejaVu Serif"},
+    "bookman": {"URW Bookman", "DejaVu Serif"},
+    "centuryschoolbook": {"C059", "DejaVu Serif"},
+    "lato": {"Lato"},
+    "opensans": {"Open Sans", "Lato"},
+    "roboto": {"Roboto", "Open Sans"},
+    "inter": {"Inter", "Open Sans"},
+    "montserrat": {"Montserrat"},
+    "poppins": {"Montserrat", "Open Sans"},
+    "nunito": {"Nunito", "Open Sans"},
+    "ibmplexsans": {"IBM Plex Sans", "Open Sans"},
+    "futura": {"Montserrat", "Liberation Sans"},
+    "centurygothic": {"Montserrat", "Liberation Sans"},
+    "avenir": {"Montserrat", "Liberation Sans"},
+    "gillsans": {"Lato", "Open Sans"},
+    "segoeui": {"Open Sans", "DejaVu Sans"},
+    "tahoma": {"DejaVu Sans"},
+    "verdana": {"DejaVu Sans"},
+    "trebuchet": {"Open Sans", "DejaVu Sans"},
+    "carlito": {"Carlito"},
+    "dejavusans": {"DejaVu Sans"},
+    "dejavuserif": {"DejaVu Serif"},
+    "dejavusansmono": {"DejaVu Sans Mono"},
+    "liberationsans": {"Liberation Sans"},
+    "liberationserif": {"Liberation Serif"},
+    "liberationmono": {"Liberation Mono"},
+    "notosans": {"Noto Sans"},
+    "notoserif": {"Noto Serif"},
 }
 
 
@@ -260,10 +314,13 @@ def _style_from_name(name: Optional[str]) -> tuple[bool, bool]:
 
 def _split_family_style(name: Optional[str]) -> tuple[str, bool, bool]:
     clean = _strip_subset(name).replace("_", " ")
+    # PostScript names often join words without separators ("ArialMT",
+    # "TimesNewRomanBold", "HelveticaNeue"). Split CamelCase before tokenizing.
+    clean = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", clean)
     bold, italic = _style_from_name(clean)
     kept: list[str] = []
     for part in re.split(r"[\s,\-]+", clean):
-        token = re.sub(r"[^a-z]", "", part.lower())
+        token = re.sub(r"[^a-z0-9]", "", part.lower())
         if not token or token in _STYLE_WORDS:
             continue
         kept.append(part)
@@ -277,20 +334,49 @@ def _family_query(family: str) -> str:
     return re.sub(r"\s+", " ", family).strip()
 
 
+def _family_variants(family: str) -> list[str]:
+    base, _bold, _italic = _split_family_style(family)
+    variants: list[str] = []
+    for candidate in (family, base, _family_query(family), _family_query(base)):
+        normalized = _normalize_font_name(candidate)
+        if normalized and normalized not in variants:
+            variants.append(normalized)
+    return variants
+
+
+def _alias_targets(family: str) -> list[str]:
+    targets: list[str] = []
+    for variant in _family_variants(family):
+        for key, names in _FAMILY_ALIASES.items():
+            if key == variant or key in variant or variant in key:
+                for name in names:
+                    if name not in targets:
+                        targets.append(name)
+    return targets
+
+
 def _font_matches_family(path: str, family: str) -> bool:
-    wanted = _normalize_font_name(family)
-    if not wanted:
-        return False
     try:
         got = _normalize_font_name(fitz.Font(fontfile=path).name or "")
     except Exception:
         return False
     if not got:
         return False
-    if wanted in got or got in wanted:
-        return True
-    aliases = _FAMILY_ALIASES.get(wanted, set())
-    return got in aliases or any(alias in got or got in alias for alias in aliases)
+    for variant in _family_variants(family):
+        if variant in got or got in variant:
+            return True
+    for alias in _alias_targets(family):
+        normalized = _normalize_font_name(alias)
+        if normalized and (normalized in got or got in normalized):
+            return True
+    return False
+
+
+def _is_base14_font(name: Optional[str]) -> bool:
+    normalized = _normalize_font_name(name)
+    return normalized.startswith(
+        ("helvetica", "times", "courier", "symbol", "zapfdingbats", "zapf")
+    )
 
 
 def _fc_match(query: str, bold: bool, italic: bool) -> Optional[str]:
@@ -322,7 +408,12 @@ def _system_font_path(basefont: str, extra_bold: bool, extra_italic: bool) -> Op
     bold = name_bold or extra_bold
     italic = name_italic or extra_italic
     queries: list[str] = []
-    for candidate in (_family_query(family), family, _family_query(family).replace(" ", "")):
+    for candidate in (
+        _family_query(family),
+        family,
+        _family_query(family).replace(" ", ""),
+        *_alias_targets(family),
+    ):
         if candidate and candidate not in queries:
             queries.append(candidate)
     for query in queries:
@@ -433,10 +524,12 @@ def _font_style_matches(font: "fitz.Font", bold: bool, italic: bool) -> bool:
 _FALLBACK_QUERIES = (
     "Arial Unicode MS",
     "DejaVu Sans",
+    "Noto Sans CJK SC",
     "Noto Sans",
     "Noto Sans Symbols 2",
     "Segoe UI Symbol",
     "Apple Symbols",
+    "Noto Color Emoji",
 )
 
 
@@ -459,20 +552,41 @@ def _fallback_selections(text: str, bold: bool, italic: bool) -> list[dict]:
 
 
 def _choose_font(
-    fonts: list[dict], name: Optional[str], bold: bool, italic: bool
+    fonts: list[dict],
+    name: Optional[str],
+    bold: bool,
+    italic: bool,
+    text: str = "",
 ) -> Optional[dict]:
     info = _match_font(fonts, name, bold, italic)
     if not info:
         return None
     basefont = info["basefont"] or name or ""
-    is_subset = bool(_SUBSET_PREFIX.match(info["basefont"] or ""))
-    if info["buffer"] and not is_subset:
+    if info["buffer"]:
         try:
             font = fitz.Font(fontbuffer=info["buffer"])
-            if _font_style_matches(font, bold, italic):
-                return {"key": f"buf:{info['xref']}", "font": font, "buffer": info["buffer"]}
+            style_ok = _font_style_matches(font, bold, italic)
+            if style_ok:
+                # Full embedded fonts can always be reused. For subsets, reuse
+                # them too when they still carry the glyphs the edit needs;
+                # per-character fallbacks cover anything the subset lacks.
+                if not _SUBSET_PREFIX.match(info["basefont"] or ""):
+                    return {"key": f"buf:{info['xref']}", "font": font, "buffer": info["buffer"]}
+                printable = [char for char in text if char.isprintable() and not char.isspace()]
+                if not printable:
+                    return {"key": f"buf:{info['xref']}", "font": font, "buffer": info["buffer"]}
+                supported = sum(1 for char in printable if _font_supports_char(font, char))
+                # Reuse a subset when it covers most of the edit so the original
+                # typeface survives; otherwise prefer a complete system font and
+                # avoid mixing typefaces inside one line.
+                if supported / len(printable) >= 0.5:
+                    return {"key": f"buf:{info['xref']}", "font": font, "buffer": info["buffer"]}
         except Exception:
             pass
+    # Standard-14 fonts are built into every PDF viewer. Prefer them over a
+    # system substitute so their appearance and names stay unchanged.
+    if _is_base14_font(basefont):
+        return None
     path = _system_font_path(basefont, bold, italic)
     if path:
         try:
@@ -965,7 +1079,7 @@ def apply_text_edits(page: "fitz.Page", edits: list[TextEdit]) -> None:
             step = step * (fontsize / item["original_size"])
         bold = bool(edit.bold)
         italic = bool(edit.italic)
-        selection = _choose_font(fonts, item["font"], bold, italic)
+        selection = _choose_font(fonts, item["font"], bold, italic, text)
         primary: Optional[tuple[str, "fitz.Font"]] = None
         if selection:
             registered_name = _register_font(page, selection, registered)

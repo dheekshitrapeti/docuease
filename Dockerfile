@@ -15,7 +15,7 @@ ENV VITE_API_URL=${VITE_API_URL}
 RUN npm run build
 
 # ---- Runtime -------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -30,9 +30,22 @@ RUN apt-get update \
         curl \
         fontconfig \
         fonts-dejavu-core \
+        fonts-dejavu-extra \
         fonts-liberation \
         fonts-crosextra-carlito \
         fonts-crosextra-caladea \
+        fonts-lato \
+        fonts-roboto \
+        fonts-open-sans \
+        fonts-inter \
+        fonts-montserrat \
+        fonts-nunito \
+        fonts-ibm-plex \
+        fonts-noto-core \
+        fonts-noto-color-emoji \
+        fonts-urw-base35 \
+        fonts-ebgaramond \
+        fonts-texgyre \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt /app/backend/requirements.txt
