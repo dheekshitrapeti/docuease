@@ -70,14 +70,20 @@ export function rotatePage(page: EditorPage, direction: 1 | -1): EditorPage {
 }
 
 export function cssFontFamily(font?: string): string {
-  const f = (font || '').toLowerCase();
+  const raw = (font || '')
+    .replace(/^[A-Z]{6}\+/, '')
+    .replace(/[_-](bold|italic|regular|oblique|roman|bolditalic|mt|psmt).*$/i, '')
+    .replace(/["\\]/g, '')
+    .trim();
+  const f = (raw || '').toLowerCase();
+  const quoted = raw ? `"${raw}", ` : '';
   if (f.includes('courier') || f.includes('mono') || f.includes('consol')) {
-    return '"Courier New", Courier, monospace';
+    return `${quoted}"Courier New", Courier, monospace`;
   }
   if (f.includes('times') || f.includes('serif') || f.includes('georgia') || f.includes('garamond')) {
-    return 'Georgia, "Times New Roman", serif';
+    return `${quoted}Georgia, "Times New Roman", serif`;
   }
-  return 'Arial, Helvetica, sans-serif';
+  return `${quoted}Arial, Helvetica, sans-serif`;
 }
 
 export function hexToRgba(hex: string | undefined, alpha = 1): string {

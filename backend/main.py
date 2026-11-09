@@ -10,9 +10,12 @@ metadata and page size — is preserved pixel for pixel.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import os
 import re
+import shutil
+import subprocess
 from html import escape as html_escape
 from pathlib import Path
 from typing import Annotated, Optional
@@ -190,6 +193,481 @@ def span_style(span: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Original-font resolution
+#
+# Replacing text with a Base-14 font makes edited runs look different from the
+# rest of the page. These helpers find the font the original run actually used
+# and re-embed it: the exact embedded font when the PDF carries a full copy,
+# otherwise a system font with the same family. Only when neither is available
+# do we fall back to the closest Base-14 font.
+# ---------------------------------------------------------------------------
+
+_SUBSET_PREFIX = re.compile(r"^[A-Z]{6}\+")
+_STYLE_WORDS = {
+    "bold",
+    "black",
+    "heavy",
+    "semibold",
+    "demibold",
+    "demi",
+    "italic",
+    "oblique",
+    "regular",
+    "book",
+    "roman",
+    "light",
+    "medium",
+    "normal",
+    "mt",
+    "psmt",
+    "boldmt",
+    "italicmt",
+    "bolditalicmt",
+}
+_SYSTEM_FONT_CACHE: dict[tuple[str, bool, bool], Optional[str]] = {}
+
+# Metric-compatible open substitutes commonly shipped on Linux/Docker. This
+# keeps Word/Office PDFs looking right when the proprietary font is not
+# installed on the server.
+_FAMILY_ALIASES = {
+    "arial": {"liberationsans", "nimbussans", "helvetica"},
+    "helvetica": {"liberationsans", "nimbussans", "arial"},
+    "times": {"liberationserif", "nimbusroman", "timesnewroman"},
+    "timesnewroman": {"liberationserif", "nimbusroman", "times"},
+    "courier": {"liberationmono", "nimbusmono", "couriernew"},
+    "couriernew": {"liberationmono", "nimbusmono", "courier"},
+    "calibri": {"carlito"},
+    "aptos": {"carlito", "liberationsans"},
+    "cambria": {"caladea"},
+}
+
+
+def _strip_subset(name: Optional[str]) -> str:
+    return _SUBSET_PREFIX.sub("", name or "")
+
+
+def _normalize_font_name(name: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _strip_subset(name).lower())
+
+
+def _style_from_name(name: Optional[str]) -> tuple[bool, bool]:
+    lower = _strip_subset(name).lower()
+    bold = any(k in lower for k in ("bold", "black", "heavy", "semibold", "demibold", "demi"))
+    italic = any(k in lower for k in ("italic", "oblique"))
+    return bold, italic
+
+
+def _split_family_style(name: Optional[str]) -> tuple[str, bool, bool]:
+    clean = _strip_subset(name).replace("_", " ")
+    bold, italic = _style_from_name(clean)
+    kept: list[str] = []
+    for part in re.split(r"[\s,\-]+", clean):
+        token = re.sub(r"[^a-z]", "", part.lower())
+        if not token or token in _STYLE_WORDS:
+            continue
+        kept.append(part)
+    family = " ".join(kept).strip() or clean
+    return family, bold, italic
+
+
+def _family_query(family: str) -> str:
+    family = re.sub(r"(?i)(psmt|mt)$", "", family)
+    family = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", family)
+    return re.sub(r"\s+", " ", family).strip()
+
+
+def _font_matches_family(path: str, family: str) -> bool:
+    wanted = _normalize_font_name(family)
+    if not wanted:
+        return False
+    try:
+        got = _normalize_font_name(fitz.Font(fontfile=path).name or "")
+    except Exception:
+        return False
+    if not got:
+        return False
+    if wanted in got or got in wanted:
+        return True
+    aliases = _FAMILY_ALIASES.get(wanted, set())
+    return got in aliases or any(alias in got or got in alias for alias in aliases)
+
+
+def _fc_match(query: str, bold: bool, italic: bool) -> Optional[str]:
+    key = (query, bold, italic)
+    if key in _SYSTEM_FONT_CACHE:
+        return _SYSTEM_FONT_CACHE[key]
+    path: Optional[str] = None
+    executable = shutil.which("fc-match")
+    if executable and query:
+        pattern = query + (":bold" if bold else "") + (":italic" if italic else "")
+        try:
+            result = subprocess.run(
+                [executable, "-f", "%{file}", pattern],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            candidate = (result.stdout or "").strip().splitlines()
+            if candidate and os.path.isfile(candidate[0]):
+                path = candidate[0]
+        except Exception:
+            path = None
+    _SYSTEM_FONT_CACHE[key] = path
+    return path
+
+
+def _system_font_path(basefont: str, extra_bold: bool, extra_italic: bool) -> Optional[str]:
+    family, name_bold, name_italic = _split_family_style(basefont)
+    bold = name_bold or extra_bold
+    italic = name_italic or extra_italic
+    queries: list[str] = []
+    for candidate in (_family_query(family), family, _family_query(family).replace(" ", "")):
+        if candidate and candidate not in queries:
+            queries.append(candidate)
+    for query in queries:
+        path = _fc_match(query, bold, italic)
+        if path and _font_matches_family(path, family):
+            return path
+    return None
+
+
+def _page_fonts(page: "fitz.Page") -> list[dict]:
+    """Fonts referenced by *page*, with their embedded bytes when available."""
+    fonts: list[dict] = []
+    document = page.parent
+    try:
+        entries = page.get_fonts(full=True)
+    except Exception:
+        entries = []
+    for entry in entries:
+        if len(entry) < 5:
+            continue
+        xref, ext, ftype, basefont, resname = (
+            entry[0],
+            entry[1] or "",
+            entry[2] or "",
+            entry[3] or "",
+            entry[4] or "",
+        )
+        buffer = b""
+        if xref and ext.lower() not in ("", "n/a"):
+            try:
+                buffer = document.extract_font(xref)[3] or b""
+            except Exception:
+                buffer = b""
+        fonts.append(
+            {
+                "xref": xref,
+                "ext": ext,
+                "type": ftype,
+                "basefont": basefont,
+                "resname": resname,
+                "buffer": buffer,
+            }
+        )
+    return fonts
+
+
+def _match_font(fonts: list[dict], name: Optional[str], bold: bool, italic: bool) -> Optional[dict]:
+    wanted = _normalize_font_name(name)
+    if not wanted:
+        return None
+    best: Optional[dict] = None
+    best_score = 0.0
+    for info in fonts:
+        score = 0.0
+        for label in (_normalize_font_name(info["basefont"]), _normalize_font_name(info["resname"])):
+            if not label:
+                continue
+            if label == wanted:
+                score = max(score, 3.0)
+            elif wanted in label or label in wanted:
+                score = max(score, 2.0)
+        if score <= 0:
+            continue
+        font_bold, font_italic = _style_from_name(info["basefont"] or info["resname"])
+        if font_bold == bool(bold):
+            score += 0.4
+        if font_italic == bool(italic):
+            score += 0.2
+        if score > best_score:
+            best_score, best = score, info
+    return best
+
+
+def _text_supported(font: "fitz.Font", text: str) -> bool:
+    for char in text:
+        if char in "\r\n\t":
+            continue
+        code = ord(char)
+        if code < 32:
+            continue
+        try:
+            if not font.has_glyph(code):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _font_supports_char(font: "fitz.Font", char: str) -> bool:
+    if char in "\r\n\t":
+        return True
+    code = ord(char)
+    if code < 32:
+        return True
+    try:
+        return bool(font.has_glyph(code))
+    except Exception:
+        return False
+
+
+def _font_style_matches(font: "fitz.Font", bold: bool, italic: bool) -> bool:
+    lower = (font.name or "").lower()
+    font_bold = any(k in lower for k in ("bold", "black", "heavy", "semibold", "demibold", "demi"))
+    font_italic = any(k in lower for k in ("italic", "oblique"))
+    return font_bold == bool(bold) and font_italic == bool(italic)
+
+
+_FALLBACK_QUERIES = (
+    "Arial Unicode MS",
+    "DejaVu Sans",
+    "Noto Sans",
+    "Noto Sans Symbols 2",
+    "Segoe UI Symbol",
+    "Apple Symbols",
+)
+
+
+def _fallback_selections(text: str, bold: bool, italic: bool) -> list[dict]:
+    """Fonts that can render characters the primary font is missing."""
+    selections: list[dict] = []
+    seen: set[str] = set()
+    for query in _FALLBACK_QUERIES:
+        path = _fc_match(query, bold, italic)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        try:
+            font = fitz.Font(fontfile=path)
+        except Exception:
+            continue
+        if _text_supported(font, text):
+            selections.append({"key": f"file:{path}", "font": font, "path": path})
+    return selections
+
+
+def _choose_font(
+    fonts: list[dict], name: Optional[str], bold: bool, italic: bool
+) -> Optional[dict]:
+    info = _match_font(fonts, name, bold, italic)
+    if not info:
+        return None
+    basefont = info["basefont"] or name or ""
+    is_subset = bool(_SUBSET_PREFIX.match(info["basefont"] or ""))
+    if info["buffer"] and not is_subset:
+        try:
+            font = fitz.Font(fontbuffer=info["buffer"])
+            if _font_style_matches(font, bold, italic):
+                return {"key": f"buf:{info['xref']}", "font": font, "buffer": info["buffer"]}
+        except Exception:
+            pass
+    path = _system_font_path(basefont, bold, italic)
+    if path:
+        try:
+            font = fitz.Font(fontfile=path)
+            if _font_style_matches(font, bold, italic):
+                return {"key": f"file:{path}", "font": font, "path": path}
+        except Exception:
+            pass
+    return None
+
+
+def _register_font(page: "fitz.Page", selection: dict, cache: dict[str, str]) -> Optional[str]:
+    key = selection["key"]
+    if key in cache:
+        return cache[key]
+    try:
+        existing = {entry[4] for entry in page.get_fonts(full=True) if len(entry) > 4}
+    except Exception:
+        existing = set()
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+    name = f"DE{digest}"
+    suffix = 1
+    while name in existing:
+        name = f"DE{digest}_{suffix}"
+        suffix += 1
+    try:
+        if "buffer" in selection:
+            page.insert_font(fontname=name, fontbuffer=selection["buffer"])
+        else:
+            page.insert_font(fontname=name, fontfile=selection["path"])
+    except Exception:
+        return None
+    cache[key] = name
+    return name
+
+
+def _original_text_metrics(
+    page: "fitz.Page", rect: fitz.Rect, data: Optional[dict] = None
+) -> tuple[Optional[str], Optional[float], Optional[float], Optional[float]]:
+    """Return (dominant font, first baseline, line step, font size) for *rect*."""
+    lines: list[tuple[float, float]] = []
+    font_lengths: dict[str, int] = {}
+    font_sizes: dict[str, float] = {}
+    if data is None:
+        try:
+            data = page.get_text("dict")
+        except Exception:
+            return None, None, None, None
+    for block in data.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            line_box = fitz.Rect(line.get("bbox", (0, 0, 0, 0)))
+            if line_box.is_empty or not line_box.intersects(rect):
+                continue
+            spans = line.get("spans", [])
+            origins = [span.get("origin") for span in spans if span.get("origin")]
+            if not origins:
+                continue
+            lines.append((line_box.y0, float(origins[0][1])))
+            for span in spans:
+                text = (span.get("text") or "").strip()
+                if not text:
+                    continue
+                font = span.get("font") or ""
+                font_lengths[font] = font_lengths.get(font, 0) + len(text)
+                font_sizes.setdefault(font, float(span.get("size") or 12))
+    if not lines:
+        return None, None, None, None
+    lines.sort(key=lambda item: item[0])
+    baseline = lines[0][1]
+    step = lines[1][1] - lines[0][1] if len(lines) > 1 else None
+    if step is not None and step <= 0:
+        step = None
+    if not font_lengths:
+        return None, baseline, step, None
+    dominant = max(font_lengths, key=font_lengths.get)
+    return dominant, baseline, step, font_sizes.get(dominant)
+
+
+def _split_runs(
+    line: str,
+    primary: tuple[str, "fitz.Font"],
+    fallbacks: list[tuple[str, "fitz.Font"]],
+) -> list[tuple[str, str, "fitz.Font"]]:
+    """Split a line into consecutive runs that each use the best available font."""
+    runs: list[tuple[str, str, "fitz.Font"]] = []
+    current: Optional[tuple[str, "fitz.Font"]] = None
+    buffer: list[str] = []
+
+    def pick(char: str) -> tuple[str, "fitz.Font"]:
+        if _font_supports_char(primary[1], char):
+            return primary
+        for fallback in fallbacks:
+            if _font_supports_char(fallback[1], char):
+                return fallback
+        return primary
+
+    for char in line:
+        chosen = pick(char)
+        if current is None or chosen[0] != current[0]:
+            if current is not None and buffer:
+                runs.append(("".join(buffer), current[0], current[1]))
+            current = chosen
+            buffer = [char]
+        else:
+            buffer.append(char)
+    if current is not None and buffer:
+        runs.append(("".join(buffer), current[0], current[1]))
+    return runs
+
+
+def _draw_text_runs(
+    page: "fitz.Page",
+    rect: fitz.Rect,
+    text: str,
+    fontsize: float,
+    primary: tuple[str, "fitz.Font"],
+    fallbacks: list[tuple[str, "fitz.Font"]],
+    color: tuple[float, ...],
+    align: int,
+    baseline: Optional[float],
+    line_step: Optional[float],
+) -> None:
+    rect = fitz.Rect(rect)
+    rect.normalize()
+    if baseline is None:
+        baseline = rect.y0 + fontsize * 1.075
+    step = line_step if line_step and line_step > 0 else fontsize * 1.2
+    limit = page.mediabox.height
+    for index, line in enumerate(text.split("\n")):
+        if not line.strip():
+            continue
+        y = baseline + index * step
+        if y > limit + fontsize:
+            break
+        runs = _split_runs(line, primary, fallbacks)
+        widths = []
+        for run, _name, font in runs:
+            try:
+                widths.append(font.text_length(run, fontsize=fontsize))
+            except Exception:
+                widths.append(0.0)
+        total = sum(widths)
+        if align == fitz.TEXT_ALIGN_CENTER:
+            x = rect.x0 + max(0.0, (rect.width - total) / 2)
+        elif align == fitz.TEXT_ALIGN_RIGHT:
+            x = rect.x1 - total
+        else:
+            x = rect.x0
+        for (run, name, _font), width in zip(runs, widths):
+            if run.strip():
+                try:
+                    page.insert_text(
+                        (x, y),
+                        run,
+                        fontname=name,
+                        fontsize=fontsize,
+                        color=color,
+                        overlay=True,
+                    )
+                except Exception:
+                    pass
+            x += width
+
+
+def infer_alignment(lines: list[dict], block_rect: fitz.Rect, matrix: fitz.Matrix) -> str:
+    """Best-effort alignment from the relative position of each line."""
+    boxes: list[fitz.Rect] = []
+    for line in lines:
+        text = "".join(span.get("text", "") for span in line.get("spans", []))
+        if not text.strip():
+            continue
+        box = fitz.Rect(line.get("bbox", (0, 0, 0, 0))) * matrix
+        if not box.is_empty:
+            boxes.append(box)
+    if len(boxes) < 2 or block_rect.width <= 0:
+        return "left"
+
+    def spread(values: list[float]) -> float:
+        return max(values) - min(values)
+
+    tolerance = max(2.0, block_rect.width * 0.03)
+    lefts = [box.x0 - block_rect.x0 for box in boxes]
+    rights = [block_rect.x1 - box.x1 for box in boxes]
+    if spread(lefts) <= tolerance:
+        return "left"
+    if spread(rights) <= tolerance:
+        return "right"
+    centers = [((box.x0 + box.x1) - (block_rect.x0 + block_rect.x1)) / 2 for box in boxes]
+    if spread(centers) <= tolerance:
+        return "center"
+    return "left"
+
+
 def validate_pdf_bytes(data: bytes, filename: str) -> None:
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(415, "Please upload a PDF file.")
@@ -207,6 +685,65 @@ def render_scale(page_width: float, page_height: float, page_count: int) -> floa
     return max(0.6, min(scale, MAX_RENDER_EDGE / longest))
 
 
+def line_style_key(line: dict) -> Optional[tuple]:
+    spans = [span for span in line.get("spans", []) if (span.get("text") or "").strip()]
+    if not spans:
+        return None
+    dominant = max(spans, key=lambda span: len(span.get("text", "")))
+    style = span_style(dominant)
+    font = _strip_subset(style["font"]).lower()
+    return (font, style["bold"], style["italic"], round(style["fontSize"], 1), style["color"])
+
+
+def group_block_lines(lines: list[dict]) -> list[list[dict]]:
+    """Split one PDF text block into editable runs.
+
+    MuPDF groups text by proximity, so a table row often arrives as several
+    horizontally separated lines inside one block. Joining those with newlines
+    would stack them vertically on export and destroy the layout. Lines that
+    share a baseline become individual runs; vertically stacked, aligned lines
+    with the same style stay together as a paragraph.
+    """
+    entries: list[tuple[fitz.Rect, dict, Optional[tuple]]] = []
+    for line in lines:
+        text = "".join(span.get("text", "") for span in line.get("spans", []))
+        if not text.strip():
+            continue
+        box = fitz.Rect(line.get("bbox", (0, 0, 0, 0)))
+        if box.is_empty:
+            continue
+        entries.append((box, line, line_style_key(line)))
+    entries.sort(key=lambda item: (round(item[0].y0, 1), item[0].x0))
+
+    groups: list[list[tuple[fitz.Rect, dict, Optional[tuple]]]] = []
+    for box, line, style_key in entries:
+        if not groups:
+            groups.append([(box, line, style_key)])
+            continue
+        group = groups[-1]
+        last_box = group[-1][0]
+        same_style = group[0][2] == style_key
+        row_tolerance = max(2.0, last_box.height * 0.5)
+        same_row = abs(box.y0 - last_box.y0) <= row_tolerance
+        gap = box.y0 - last_box.y1
+        too_far = gap > max(last_box.height, box.height) * 2.5
+        group_x0 = min(item[0].x0 for item in group)
+        group_x1 = max(item[0].x1 for item in group)
+        group_width = group_x1 - group_x0
+        x_tolerance = max(3.0, group_width * 0.08)
+        aligned = (
+            abs(box.x0 - group_x0) <= x_tolerance
+            or abs(box.x1 - group_x1) <= x_tolerance
+            or abs((box.x0 + box.x1) - (group_x0 + group_x1)) / 2 <= x_tolerance
+            or (box.x0 >= group_x0 - x_tolerance and box.x1 <= group_x1 + x_tolerance)
+        )
+        if same_style and not same_row and not too_far and gap > -row_tolerance and aligned:
+            group.append((box, line, style_key))
+        else:
+            groups.append([(box, line, style_key)])
+    return [[line for _box, line, _style in group] for group in groups]
+
+
 def extract_blocks(page: "fitz.Page", page_index: int) -> list[dict]:
     """Return editable text blocks in *display* (rotated) coordinates."""
     rmat = page.rotation_matrix
@@ -215,44 +752,52 @@ def extract_blocks(page: "fitz.Page", page_index: int) -> list[dict]:
     for block_index, block in enumerate(data.get("blocks", [])):
         if block.get("type") != 0:
             continue
-        lines = block.get("lines", [])
-        text_lines: list[str] = []
-        spans: list[dict] = []
-        for line in lines:
-            span_list = line.get("spans", [])
-            line_text = "".join(span.get("text", "") for span in span_list)
-            if not line_text.strip() and not text_lines:
+        groups = group_block_lines(block.get("lines", []))
+        for group_index, group in enumerate(groups):
+            text_lines: list[str] = []
+            spans: list[dict] = []
+            union: Optional[fitz.Rect] = None
+            for line in group:
+                line_text = "".join(span.get("text", "") for span in line.get("spans", []))
+                text_lines.append(line_text.rstrip())
+                for span in line.get("spans", []):
+                    if span.get("text", "").strip():
+                        spans.append(span)
+                box = fitz.Rect(line.get("bbox", (0, 0, 0, 0)))
+                if union is None:
+                    union = box
+                else:
+                    union.include_rect(box)
+            text = "\n".join(text_lines).strip()
+            if not text or union is None:
                 continue
-            text_lines.append(line_text.rstrip())
-            for span in span_list:
-                if span.get("text", "").strip():
-                    spans.append(span)
-        text = "\n".join(text_lines).strip()
-        if not text:
-            continue
-        dominant = max(spans, key=lambda s: len(s.get("text", ""))) if spans else {}
-        style = span_style(dominant) if dominant else {
-            "font": "Helvetica",
-            "fontSize": 12,
-            "bold": False,
-            "italic": False,
-            "color": "#000000",
-        }
-        rect = fitz.Rect(block["bbox"]) * rmat
-        blocks.append(
-            {
-                "id": f"p{page_index}-b{block_index}",
-                "bbox": [
-                    round(rect.x0, 2),
-                    round(rect.y0, 2),
-                    round(rect.x1, 2),
-                    round(rect.y1, 2),
-                ],
-                "text": text,
-                "originalText": text,
-                **style,
+            dominant = max(spans, key=lambda s: len(s.get("text", ""))) if spans else {}
+            style = span_style(dominant) if dominant else {
+                "font": "Helvetica",
+                "fontSize": 12,
+                "bold": False,
+                "italic": False,
+                "color": "#000000",
             }
-        )
+            rect = union * rmat
+            style["align"] = infer_alignment(group, rect, rmat)
+            block_id = f"p{page_index}-b{block_index}"
+            if len(groups) > 1:
+                block_id += f"-{group_index}"
+            blocks.append(
+                {
+                    "id": block_id,
+                    "bbox": [
+                        round(rect.x0, 2),
+                        round(rect.y0, 2),
+                        round(rect.x1, 2),
+                        round(rect.y1, 2),
+                    ],
+                    "text": text,
+                    "originalText": text,
+                    **style,
+                }
+            )
     blocks.sort(key=lambda b: (round(b["bbox"][1], 1), round(b["bbox"][0], 1)))
     return blocks
 
@@ -373,29 +918,86 @@ def apply_text_edits(page: "fitz.Page", edits: list[TextEdit]) -> None:
     valid = [e for e in edits if e.bbox and len(e.bbox) == 4]
     if not valid:
         return
-    redacted = False
+    # Capture the original fonts and line geometry before redaction destroys them.
+    fonts = _page_fonts(page)
+    try:
+        text_data = page.get_text("dict")
+    except Exception:
+        text_data = None
+    prepared: list[dict] = []
     for edit in valid:
         rect = to_unrotated(fitz.Rect(edit.bbox), page)
         if rect.is_empty or rect.is_infinite:
             continue
-        page.add_redact_annot(rect, fill=False)
-        redacted = True
-    if redacted:
-        page.apply_redactions(
-            images=fitz.PDF_REDACT_IMAGE_NONE,
-            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-            text=fitz.PDF_REDACT_TEXT_REMOVE,
+        rect.normalize()
+        span_font, baseline, step, original_size = _original_text_metrics(page, rect, text_data)
+        prepared.append(
+            {
+                "edit": edit,
+                "rect": rect,
+                "font": span_font or edit.font,
+                "baseline": baseline,
+                "step": step,
+                "original_size": original_size,
+            }
         )
-    for edit in valid:
-        rect = to_unrotated(fitz.Rect(edit.bbox), page)
-        insert_text_block(
+    if not prepared:
+        return
+    for item in prepared:
+        page.add_redact_annot(item["rect"], fill=False)
+    page.apply_redactions(
+        images=fitz.PDF_REDACT_IMAGE_NONE,
+        graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+        text=fitz.PDF_REDACT_TEXT_REMOVE,
+    )
+    registered: dict[str, str] = {}
+    for item in prepared:
+        edit = item["edit"]
+        rect = item["rect"]
+        text = edit.text or ""
+        if not text.strip():
+            continue
+        fontsize = max(4.0, min(float(edit.fontSize or 12), 200.0))
+        color = hex_to_rgb(edit.color)
+        align = align_value(edit.align)
+        step = item["step"]
+        if step and item["original_size"]:
+            step = step * (fontsize / item["original_size"])
+        bold = bool(edit.bold)
+        italic = bool(edit.italic)
+        selection = _choose_font(fonts, item["font"], bold, italic)
+        primary: Optional[tuple[str, "fitz.Font"]] = None
+        if selection:
+            registered_name = _register_font(page, selection, registered)
+            if registered_name:
+                primary = (registered_name, selection["font"])
+        fontname = resolve_font(item["font"], bold, italic)
+        if primary is None:
+            try:
+                primary = (fontname, fitz.Font(fontname))
+            except Exception:
+                primary = None
+        if primary is None:
+            insert_text_block(page, rect, text, fontsize, fontname, color, align)
+            continue
+        missing = "".join(char for char in text if not _font_supports_char(primary[1], char))
+        fallbacks: list[tuple[str, "fitz.Font"]] = []
+        if missing.strip():
+            for fallback in _fallback_selections(missing, bold, italic):
+                name = _register_font(page, fallback, registered)
+                if name:
+                    fallbacks.append((name, fallback["font"]))
+        _draw_text_runs(
             page,
             rect,
-            edit.text,
-            edit.fontSize,
-            resolve_font(edit.font, edit.bold, edit.italic),
-            hex_to_rgb(edit.color),
-            align_value(edit.align),
+            text,
+            fontsize,
+            primary,
+            fallbacks,
+            color,
+            align,
+            item["baseline"],
+            step,
         )
 
 
@@ -603,15 +1205,34 @@ def build_pdf(files: list[bytes], payload: ExportPayload) -> bytes:
             apply_text_edits(page, spec.textEdits)
             for overlay in spec.overlays:
                 apply_overlay(page, overlay)
-        out.set_metadata(
-            {
-                "title": safe_filename(payload.filename),
-                "producer": "DocuEase",
-                "creator": "DocuEase PDF Editor",
-            }
-        )
+        metadata: dict[str, str] = {}
+        for source in sources:
+            try:
+                source_meta = source.metadata or {}
+            except Exception:
+                source_meta = {}
+            if source_meta:
+                allowed = {
+                    "title",
+                    "author",
+                    "subject",
+                    "keywords",
+                    "creator",
+                    "producer",
+                    "creationDate",
+                    "modDate",
+                    "trapped",
+                }
+                metadata = {k: v for k, v in source_meta.items() if k in allowed and v}
+                break
+        metadata.setdefault("title", safe_filename(payload.filename))
+        metadata.setdefault("producer", "DocuEase")
+        metadata.setdefault("creator", "DocuEase PDF Editor")
+        out.set_metadata(metadata)
         buf = io.BytesIO()
-        out.save(buf, garbage=4, deflate=True, clean=True)
+        # clean=False keeps untouched content streams byte-for-byte identical to
+        # the source; only the objects we actually changed are rewritten.
+        out.save(buf, garbage=4, deflate=True, clean=False)
         return buf.getvalue()
     finally:
         for source in sources:

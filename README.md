@@ -100,7 +100,7 @@ The backend copies untouched pages with `insert_pdf`, applies redactions and ins
 
 PyMuPDF reports text boxes in unrotated page space. The API multiplies them by `page.rotation_matrix` so the frontend always works in display coordinates. On export, after `page.set_rotation(...)`, the backend multiplies boxes by `page.derotation_matrix` before redacting/inserting. The frontend rotates boxes clockwise for 90/180/270 degree page turns, matching PyMuPDF's own rotation math.
 
-Unicode edits use MuPDF's rich-text engine with font fallback, so smart quotes, accented characters and CJK text keep their glyphs.
+Edited runs keep the original font: the backend re-embeds the exact font when the PDF carries a full copy, finds the same family on the system when the PDF only has a subset, and only then falls back to a Base-14 font. Replacement text is anchored to the original baseline and line spacing, and characters the primary font does not cover (symbols, CJK, emoji) are drawn with a fallback font.
 
 ## API summary
 
@@ -130,7 +130,7 @@ frontend/src/styles.css             Landing page and editor styles
 ## Current limitations
 
 - Scanned/image-only PDFs have no selectable text. You can still annotate them, rotate/reorder pages and export, but there are no real text runs to edit.
-- Replaced text is drawn using the closest available PDF base font and may not match a custom embedded font exactly. Text that does not fit its original box can grow downward.
+- Replaced text reuses the original embedded font when it is fully embedded. When the PDF only embeds a subset, the backend matches the family against fonts installed on the server; custom fonts that are not installed will use the closest fallback. Text that grows wider can extend past its original box.
 - Edited text is covered by a white patch in the preview; the export redacts the original glyphs properly. On colored backgrounds the preview patch may not match perfectly.
 - DOCX export is a text-and-style export, not a pixel-perfect conversion of the PDF layout.
 - Files are processed in memory and are not written to disk by the server.
