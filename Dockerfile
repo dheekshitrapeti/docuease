@@ -38,9 +38,6 @@ RUN apt-get update \
         fonts-roboto \
         fonts-open-sans \
         fonts-inter \
-        fonts-montserrat \
-        fonts-nunito \
-        fonts-ibm-plex \
         fonts-noto-core \
         fonts-noto-color-emoji \
         fonts-urw-base35 \

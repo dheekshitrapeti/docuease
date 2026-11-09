@@ -130,7 +130,7 @@ frontend/src/styles.css             Landing page and editor styles
 ## Current limitations
 
 - Scanned/image-only PDFs have no selectable text. You can still annotate them, rotate/reorder pages and export, but there are no real text runs to edit.
-- Replaced text reuses the original embedded font when it is fully embedded, and reuses an embedded subset whenever that subset contains the characters being typed. If the subset lacks glyphs or a custom font is not installed on the server, the backend picks the closest installed family (Lato, Open Sans, Roboto, Inter, Montserrat, Carlito, Liberation, DejaVu and others are bundled). Text that grows wider can extend past its original box.
+- Replaced text reuses the original embedded font when it is fully embedded, and reuses an embedded subset whenever that subset contains the characters being typed. If the subset lacks glyphs or a custom font is not installed on the server, the backend picks the closest installed family (Lato, Open Sans, Roboto, Inter, Carlito, Liberation, DejaVu, URW base35 and others are bundled). Text that grows wider can extend past its original box.
 - Edited text is covered by a white patch in the preview; the export redacts the original glyphs properly. On colored backgrounds the preview patch may not match perfectly.
 - DOCX export is a text-and-style export, not a pixel-perfect conversion of the PDF layout.
 - Files are processed in memory and are not written to disk by the server.
