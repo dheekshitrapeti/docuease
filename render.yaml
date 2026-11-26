@@ -2,7 +2,7 @@ services:
   - type: web
     name: docuease
     runtime: docker
-    plan: free
+    plan: free,,
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /health
